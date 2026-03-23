@@ -4,6 +4,8 @@
 #include <Wire.h>
 #include <DHT.h>
 #include <BluetoothSerial.h>
+#include <esp_sleep.h>
+#include <driver/rtc_io.h>
 
 #define microphone_digital_pin 25 //yellow
 #define microphone_analog_pin 33 //yellow
@@ -19,7 +21,11 @@
 #define temperature_read_period 60 //how often temperature is read in seconds
 
 #define accelerometer_threshold 1 //how strong acceleration must be to trigger interrupt
-#define accelerometer_duration 5 //how long acceleration must persist to trigger interrupt
+#define accelerometer_duration 1 //how long acceleration must persist to trigger interrupt
+
+#define debounce_time 500000 //in us, 100 ms = 100000 us
+
+#define BUTTON_PIN_BITMASK(GPIO) (1ULL << GPIO) //for configuring gpio interrupt wake up from sleep
 
 DHT temperature(temperature_pin, DHT11);
 
@@ -30,6 +36,10 @@ hw_timer_t *timer = NULL;
 const uint8_t timer_num = 0;
 const uint16_t timer_divider = 80;
 const uint64_t timer_alarm_value = 1000000 * temperature_read_period;
+
+const gpio_num_t microphone_rtc_gpio = GPIO_NUM_25;
+const gpio_num_t infrared_rtc_gpio = GPIO_NUM_26;
+const gpio_num_t accelerometer_rtc_gpio = GPIO_NUM_27;
 
 int microphone_analog_value = 0;
 
@@ -42,16 +52,34 @@ volatile bool infrared_flag = false;
 volatile bool temperature_flag = false;
 volatile bool accelerometer_flag = false;
 
+volatile uint64_t last_microphone_interrupt = 0;
+volatile uint64_t last_accelerometer_interrupt = 0;
+volatile uint64_t last_infrared_interrupt = 0;
+
+volatile uint64_t current_microphone_interrupt = 0;
+volatile uint64_t current_accelerometer_interrupt = 0;
+volatile uint64_t current_infrared_interrupt = 0;
+
 String device_name = "Team 9 ESP32 Sleep Monitor";
 
 BluetoothSerial bluetooth;
 
 void ARDUINO_ISR_ATTR microphone_ISR() {
-  microphone_flag = true;
+  current_microphone_interrupt = esp_timer_get_time();
+
+  if(current_microphone_interrupt - last_microphone_interrupt > debounce_time) {
+    microphone_flag = true;
+    last_microphone_interrupt = current_microphone_interrupt;
+  }
 }
 
 void ARDUINO_ISR_ATTR infrared_ISR() {
-  infrared_flag = true;
+  current_infrared_interrupt = esp_timer_get_time();
+
+  if(current_infrared_interrupt - last_infrared_interrupt > debounce_time) {
+    infrared_flag = true;
+    last_infrared_interrupt = current_infrared_interrupt;
+  }
 }
 
 void ARDUINO_ISR_ATTR temperature_ISR() {
@@ -59,7 +87,12 @@ void ARDUINO_ISR_ATTR temperature_ISR() {
 }
 
 void ARDUINO_ISR_ATTR accelerometer_ISR() {
-  accelerometer_flag = true;
+  current_accelerometer_interrupt = esp_timer_get_time();
+
+  if(current_accelerometer_interrupt - last_accelerometer_interrupt > debounce_time) {
+    accelerometer_flag = true;
+    last_accelerometer_interrupt = current_accelerometer_interrupt;
+  }
 }
 
 void setup() {
@@ -81,14 +114,15 @@ void setup() {
 
   accelerometer.begin();
 
-  accelerometer.setAccelerometerRange(MPU6050_RANGE_4_G);
-  accelerometer.setFilterBandwidth(MPU6050_BAND_21_HZ);
+  accelerometer.setAccelerometerRange(MPU6050_RANGE_2_G);
+  accelerometer.setGyroRange(MPU6050_RANGE_250_DEG);
+  accelerometer.setFilterBandwidth(MPU6050_BAND_260_HZ);
 
   accelerometer.setMotionDetectionThreshold(accelerometer_threshold);
   accelerometer.setMotionDetectionDuration(accelerometer_duration);
   accelerometer.setMotionInterrupt(true);
 
-  accelerometer.setInterruptPinLatch(true);
+  accelerometer.setInterruptPinLatch(false);
   accelerometer.setInterruptPinPolarity(false);
 
   pinMode(accelerometer_interrupt_pin, INPUT);
@@ -101,9 +135,24 @@ void setup() {
 
   Serial.begin(115200);
   Serial.printf("\n\n");
+
+  //rtc_gpio_deinit(microphone_rtc_gpio);
+  //rtc_gpio_deinit(infrared_rtc_gpio);
+  //rtc_gpio_deinit(accelerometer_rtc_gpio);
+
+  //uint64_t bitmask = BUTTON_PIN_BITMASK(microphone_rtc_gpio) | BUTTON_PIN_BITMASK(infrared_rtc_gpio) | BUTTON_PIN_BITMASK(accelerometer_rtc_gpio);
+  //esp_sleep_enable_ext1_wakeup(bitmask, ESP_EXT1_WAKEUP_ANY_HIGH);
+
+  //esp_sleep_enable_timer_wakeup(temperature_read_period * 1000000ULL);
 }
 
 void loop() {
+  //esp_sleep_wakeup_cause_t wakeup_reason = esp_sleep_get_wakeup_cause();
+
+  //if(wakeup_reason == ESP_SLEEP_WAKEUP_TIMER) {
+  //  temperature_flag = true;
+  //}
+
   if(microphone_flag) {
     microphone_analog_value = analogRead(microphone_analog_pin);
 
@@ -135,6 +184,7 @@ void loop() {
     bluetooth.printf("TEMP %f HUMID %f INDEX %f\n", temperature_value, humidity_value, heat_index_value);
 
     temperature_flag = false;
+    microphone_flag = false;
   }
 
   if(accelerometer_flag) {
@@ -145,4 +195,6 @@ void loop() {
     accelerometer.getMotionInterruptStatus();
     accelerometer_flag = false;
   }
+
+  //esp_light_sleep_start();
 }
