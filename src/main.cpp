@@ -77,8 +77,9 @@ struct EventBuffer {
 
   uint16_t head = 0;
   uint16_t tail = 0;
-  
+
   bool overflow = false; //set to true if we run out of space
+  uint16_t dropped_events = 0; //how many events had to be overwritten if overflow occurs
 };
 
 DHT temperature(temperature_pin, DHT11);
@@ -89,6 +90,7 @@ uint64_t monitor_start_time; //when we received start signal for time keeping
 SystemState system_state; //current state
 SystemMode system_mode; //monitoring mode
 EventBuffer event_buffer; //sleep data buffer
+uint16_t event_index = 0; //used for transmitting data
 
 const gpio_num_t microphone_rtc_gpio = GPIO_NUM_25;
 const gpio_num_t infrared_rtc_gpio = GPIO_NUM_26;
@@ -117,17 +119,31 @@ volatile uint64_t current_stop_button_interrupt;
 String device_name = "Team 9 ESP32 Sleep Monitor";
 BluetoothSerial bluetooth;
 
-void push(EventBuffer &event_buffer, const Event &event) {
+void push(EventBuffer& event_buffer, const Event& event) {
   event_buffer.buffer[event_buffer.head] = event;
 
   uint16_t next = (event_buffer.head + 1) % buffer_size;
 
   if(next == event_buffer.tail) {
     event_buffer.overflow = true;
+    event_buffer.dropped_events++;
+
     event_buffer.tail = (event_buffer.tail + 1) % buffer_size;
   }
 
   event_buffer.head = next;
+}
+
+Event* pop(EventBuffer& event_buffer) {
+  if(event_buffer.head == event_buffer.tail) {
+    return NULL;
+  }
+
+  Event* event = &event_buffer.buffer[event_buffer.tail];
+
+  event_buffer.tail = (event_buffer.tail + 1) % buffer_size;
+
+  return event;
 }
 
 void ARDUINO_ISR_ATTR microphone_ISR() {
@@ -227,6 +243,34 @@ void init_mode() {
   esp_sleep_enable_timer_wakeup(temperature_read_period * 1000000ULL);
 
   system_state = MONITORING;
+}
+
+void deinit_mode() {
+  switch(system_mode) {
+    case IR_MODE:
+      detachInterrupt(microphone_digital_pin);
+      detachInterrupt(infrared_digital_pin);
+      detachInterrupt(stop_button_pin);
+
+      break;
+
+    case ACCEL_MODE:
+      detachInterrupt(microphone_digital_pin);
+      detachInterrupt(accelerometer_interrupt_pin);
+      detachInterrupt(stop_button_pin);
+
+      break;
+
+    case HYBRID_MODE:
+      detachInterrupt(microphone_digital_pin);
+      detachInterrupt(infrared_digital_pin);
+      detachInterrupt(accelerometer_interrupt_pin);
+      detachInterrupt(stop_button_pin);
+
+      break;
+  }
+
+  esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_ALL);
 }
 
 void wait_for_start() {
@@ -334,6 +378,8 @@ void monitoring() {
 
     system_state = WAIT_FOR_STOP;
 
+    deinit_mode();
+
     bluetooth.begin(device_name);
 
     return;
@@ -346,7 +392,73 @@ void monitoring() {
 }
 
 void wait_for_stop() {
+  if(bluetooth.available()) {
+    String message = bluetooth.readStringUntil('\n');
+    message.trim();
 
+    if(message.equals("STOP")) {
+      bluetooth.printf("---- BEGIN DATA ----\n");
+      
+      if(event_buffer.overflow) {
+        bluetooth.printf("ESP32 RAN OUT OF MEMORY, %u EVENTS WERE LOST!\n", event_buffer.dropped_events);
+      }
+
+      delay(10);
+
+      system_state = TRANSMIT_DATA;
+    }
+  }
+}
+
+void transmit_data() {
+  Event* event = pop(event_buffer);
+
+  if(event != NULL) {
+    event_index++;
+
+    uint32_t timestamp_seconds = event->timestamp / 1000000ULL;
+
+    uint8_t hours = timestamp_seconds / 3600;
+    uint8_t minutes = (timestamp_seconds % 3600) / 60;
+    uint8_t seconds = (timestamp_seconds % 3600) % 60;
+
+    switch(event->type) {
+      case EVENT_NOISE:
+        bluetooth.printf("EVENT %04u -- %02u:%02u:%02u NOISE EVENT (ANALOG VALUE: %d)\n", event_index, hours, minutes, seconds, event->noise.microphone_analog_value);
+        break;
+      
+      case EVENT_MOTION:
+        if(event->motion.source == 0) {
+          bluetooth.printf("EVENT %04u -- %02u:%02u:%02u MOTION EVENT (INFRARED SENSOR)\n", event_index, hours, minutes, seconds);
+
+        } else {
+          bluetooth.printf("EVENT %04u -- %02u:%02u:%02u MOTION EVENT (ACCELEROMETER)\n", event_index, hours, minutes, seconds);
+        }
+
+        break;
+
+      case EVENT_TEMP:
+        bluetooth.printf("EVENT %04u -- %02u:%02u:%02u TEMPERATURE / HUMIDITY / HEAT INDEX READING (%.2f F / %.2f %% / %.2f F)\n", event_index, hours, minutes, seconds, event->temp.temperature_value, event->temp.humidity_value, event->temp.heat_index_value);
+        break;
+    }
+
+    delay(10);
+
+  } else {
+    bluetooth.printf("%u EVENTS SUCCESSFULLY TRANSMITTED!", event_index);
+    bluetooth.printf("---- END DATA ----\n");
+
+    system_state = SHUTDOWN;
+  }
+}
+
+void shutdown() {
+  bluetooth.end();
+  btStop();
+
+  accelerometer.enableSleep(true);
+
+  esp_deep_sleep_start();
 }
 
 void setup() {
@@ -389,6 +501,14 @@ void loop() {
 
     case WAIT_FOR_STOP:
       wait_for_stop();
+      break;
+
+    case TRANSMIT_DATA:
+      transmit_data();
+      break;
+
+    case SHUTDOWN:
+      shutdown();
       break;
   }
 }
