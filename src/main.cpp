@@ -29,6 +29,8 @@
 
 #define buffer_size 2048 //how many events the ESP32 can hold (2048 is about 50 KB)
 
+#define mem_log_period 30 //how often to log memory usage in seconds
+
 //the different states the state machine can take
 //this machine only has one path it can take, states will always transition from top to bottom of enum
 enum SystemState {
@@ -131,6 +133,17 @@ uint64_t current_stop_button_event;
 String device_name = "Team 9 ESP32 Sleep Monitor";
 BluetoothSerial bluetooth;
 String bluetooth_message = "";
+
+uint64_t next_mem_report; //when the next memory log is
+
+//for logging memory usage
+void mem_check() {
+  size_t free = esp_get_free_heap_size();
+  size_t largest = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
+  float frag = 1.0f - ((float) largest / (float) free);
+
+  Serial.printf("HEAP -- Total free: %u, Largest free block: %u, Fragmentation: %.2f%%\n", free, largest, frag);
+}
 
 //helper function to add a new event to the buffer at the head position
 void push(EventBuffer& event_buffer, const Event& event) {
@@ -437,9 +450,11 @@ void monitoring() {
 
     temperature_active = true;
 
+    delay(10);
     event.temp.temperature_value = temperature.readTemperature(true);
     event.temp.humidity_value = temperature.readHumidity();
     event.temp.heat_index_value = temperature.computeHeatIndex(event.temp.temperature_value, event.temp.humidity_value);
+    delay(10);
     
     temperature_active = false;
 
@@ -496,6 +511,7 @@ void monitoring() {
   if(! (microphone_flag || infrared_flag || temperature_flag || accelerometer_flag || stop_button_flag)) {
     prepare_sleep();
     esp_light_sleep_start();
+    delay(10);
     prepare_wake();
   }
 }
@@ -597,6 +613,8 @@ void shutdown() {
 
 //program entry point, configures sensors and initializes state machine
 void setup() {
+  next_mem_report = esp_timer_get_time() + (mem_log_period * 1000000ULL);
+
   pinMode(microphone_digital_pin, INPUT);
   pinMode(microphone_analog_pin, INPUT);
   pinMode(infrared_digital_pin, INPUT);
@@ -632,6 +650,13 @@ void setup() {
 
 //super loop, will just keep calling the relevant state function depending on the current state of the state machine
 void loop() {
+  uint64_t now = esp_timer_get_time();
+
+  if(now > next_mem_report) {
+    mem_check();
+    next_mem_report = now + (mem_log_period * 1000000ULL);
+  }
+
   switch(system_state) {
     case WAIT_FOR_START:
       wait_for_start();
